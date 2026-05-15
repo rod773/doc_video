@@ -1,0 +1,3 @@
+Create a program in html that reads a pdf file and converts it into a downloable 
+video which shows the pages of the pdf while reading aloud them..
+the program should detect the language of the pdf.

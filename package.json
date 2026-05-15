@@ -15,6 +15,7 @@
     "@ffmpeg/util": "^0.12.2",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "framer-motion": "^12.38.0",
     "lucide-react": "^1.16.0",
     "map.prototype.getorinsertcomputed": "^1.0.1",
     "next": "16.2.6",
