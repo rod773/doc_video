@@ -233,24 +233,122 @@ export function PdfToVideoConverter() {
         setDetectedLanguage(lang);
       }
 
+      const hasText = pageTexts.some((t) => t.trim());
+      const narrateLang = lang || "English";
+      let audioBlob: Blob | null = null;
+
+      if (narrationRef.current && hasText) {
+        try {
+          setStatusText("Select 'Share audio' in the dialog to include narration...");
+          const stream = await navigator.mediaDevices.getDisplayMedia({
+            audio: true,
+            video: true,
+          });
+          const audioTracks = stream.getAudioTracks();
+          if (audioTracks.length === 0) {
+            stream.getVideoTracks().forEach((t) => t.stop());
+            setStatusText("No audio track shared. Generating video without audio...");
+          } else {
+            const audioStream = new MediaStream(audioTracks);
+            stream.getVideoTracks().forEach((t) => t.stop());
+
+            const mimeType = MediaRecorder.isTypeSupported(
+              "audio/webm;codecs=opus"
+            )
+              ? "audio/webm;codecs=opus"
+              : "audio/webm";
+            const recorder = new MediaRecorder(audioStream, { mimeType });
+            const chunks: Blob[] = [];
+            recorder.ondataavailable = (e) => {
+              if (e.data.size > 0) chunks.push(e.data);
+            };
+            const recorded = new Promise<Blob>((resolve) => {
+              recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
+            });
+
+            recorder.start(100);
+            setStatus("encoding");
+            setStatusText("Recording narration...");
+
+            await new Promise<void>((resolve) => {
+              let currentPage = 0;
+              const speakNext = () => {
+                if (currentPage >= pageTexts.length) {
+                  setTimeout(() => {
+                    recorder.stop();
+                    audioTracks.forEach((t) => t.stop());
+                    resolve();
+                  }, 500);
+                  return;
+                }
+                const text = pageTexts[currentPage];
+                currentPage++;
+                if (text.trim()) {
+                  const utterance = new SpeechSynthesisUtterance(text);
+                  utterance.lang = getLangCode(narrateLang);
+                  utterance.rate = 0.9;
+                  const voices = window.speechSynthesis.getVoices();
+                  const voice = voices.find((v) =>
+                    v.lang.startsWith(getLangCode(narrateLang).substring(0, 2))
+                  );
+                  if (voice) utterance.voice = voice;
+                  utterance.onend = () =>
+                    setTimeout(speakNext, pageDuration * 1000);
+                  utterance.onerror = () =>
+                    setTimeout(speakNext, pageDuration * 1000);
+                  window.speechSynthesis.speak(utterance);
+                } else {
+                  setTimeout(speakNext, pageDuration * 1000);
+                }
+              };
+              speakNext();
+            });
+
+            audioBlob = await recorded;
+          }
+        } catch {
+          setStatusText(
+            "Audio capture denied. Generating video without narration..."
+          );
+        }
+      }
+
       setStatus("encoding");
       setStatusText("Encoding video...");
 
       const outputName = "output.mp4";
-      await ffmpeg.exec([
+      const ffmpegArgs = [
         "-framerate",
         fps.toString(),
         "-i",
         "frame_%04d.png",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-preset",
-        "fast",
-        "-y",
-        outputName,
-      ]);
+      ];
+
+      if (audioBlob && audioBlob.size > 0) {
+        const audioData = new Uint8Array(await audioBlob.arrayBuffer());
+        await ffmpeg.writeFile("audio.webm", audioData);
+        ffmpegArgs.push("-i", "audio.webm");
+        ffmpegArgs.push(
+          "-c:v", "libx264",
+          "-pix_fmt", "yuv420p",
+          "-preset", "fast",
+          "-c:a", "aac",
+          "-b:a", "128k",
+          "-shortest",
+          "-y",
+          outputName
+        );
+      } else {
+        ffmpegArgs.push(
+          "-c:v", "libx264",
+          "-pix_fmt", "yuv420p",
+          "-preset", "fast",
+          "-y",
+          outputName
+        );
+      }
+
+      await ffmpeg.exec(ffmpegArgs);
 
       const data = await ffmpeg.readFile(outputName);
       const videoData = typeof data === "string" ? data : new Uint8Array(data);
@@ -259,22 +357,7 @@ export function PdfToVideoConverter() {
       setDownloadUrl(url);
       setProgress(100);
       setStatus("done");
-      setStatusText("Video ready!");
-
-      if (narrationRef.current && pageTexts.some((t) => t.trim())) {
-        const narrateLang = lang || "English";
-        let currentPage = 0;
-        const narrateNext = () => {
-          if (currentPage >= pageTexts.length) return;
-          const text = pageTexts[currentPage];
-          currentPage++;
-          if (text.trim()) {
-            speakPage(text, narrateLang);
-          }
-          setTimeout(narrateNext, pageDuration * 1000);
-        };
-        narrateNext();
-      }
+      setStatusText(audioBlob ? "Video with narration ready!" : "Video ready!");
     } catch (err) {
       setStatus("error");
       setStatusText(
