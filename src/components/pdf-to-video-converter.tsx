@@ -64,6 +64,55 @@ function getLangCode(language: string): string {
   return map[language] || "en-US";
 }
 
+function getShortLangCode(language: string): string {
+  const map: Record<string, string> = {
+    English: "en", Spanish: "es", French: "fr", German: "de",
+    Portuguese: "pt", Italian: "it", Russian: "ru", Chinese: "zh-CN",
+    Japanese: "ja", Korean: "ko", Arabic: "ar", Hindi: "hi",
+  };
+  return map[language] || "en";
+}
+
+async function fetchTtsAudio(text: string, lang: string): Promise<ArrayBuffer | null> {
+  const maxLen = 200;
+  const chunks: string[] = [];
+  const sentences = text.replace(/\n/g, " ").split(/(?<=[.!?])\s+/);
+  let current = "";
+  for (const s of sentences) {
+    if ((current + " " + s).length > maxLen && current) {
+      chunks.push(current.trim());
+      current = s;
+    } else {
+      current = current ? current + " " + s : s;
+    }
+  }
+  if (current.trim()) chunks.push(current.trim());
+
+  const allParts: ArrayBuffer[] = [];
+  for (const chunk of chunks) {
+    const encoded = encodeURIComponent(chunk);
+    const url = `https://translate.google.com/translate_tts?ie=UTF-8&tl=${lang}&client=tw-ob&q=${encoded}`;
+    try {
+      const resp = await fetch(url);
+      if (resp.ok) {
+        const buf = await resp.arrayBuffer();
+        if (buf.byteLength > 0) allParts.push(buf);
+      }
+    } catch {
+      // skip failed chunk
+    }
+  }
+  if (allParts.length === 0) return null;
+  const totalLen = allParts.reduce((sum, b) => sum + b.byteLength, 0);
+  const result = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const part of allParts) {
+    result.set(new Uint8Array(part), offset);
+    offset += part.byteLength;
+  }
+  return result.buffer;
+}
+
 export function PdfToVideoConverter() {
   const [file, setFile] = useState<File | null>(null);
   const [pageCount, setPageCount] = useState(0);
@@ -235,81 +284,32 @@ export function PdfToVideoConverter() {
 
       const hasText = pageTexts.some((t) => t.trim());
       const narrateLang = lang || "English";
-      let audioBlob: Blob | null = null;
+      let hasAudio = false;
 
       if (narrationRef.current && hasText) {
-        try {
-          setStatusText("Select 'Share audio' in the dialog to include narration...");
-          const stream = await navigator.mediaDevices.getDisplayMedia({
-            audio: true,
-            video: true,
-          });
-          const audioTracks = stream.getAudioTracks();
-          if (audioTracks.length === 0) {
-            stream.getVideoTracks().forEach((t) => t.stop());
-            setStatusText("No audio track shared. Generating video without audio...");
-          } else {
-            const audioStream = new MediaStream(audioTracks);
-            stream.getVideoTracks().forEach((t) => t.stop());
+        setStatusText("Generating narration audio...");
+        const ttsLang = getShortLangCode(narrateLang);
+        const pageAudioBuffers: ArrayBuffer[] = [];
 
-            const mimeType = MediaRecorder.isTypeSupported(
-              "audio/webm;codecs=opus"
-            )
-              ? "audio/webm;codecs=opus"
-              : "audio/webm";
-            const recorder = new MediaRecorder(audioStream, { mimeType });
-            const chunks: Blob[] = [];
-            recorder.ondataavailable = (e) => {
-              if (e.data.size > 0) chunks.push(e.data);
-            };
-            const recorded = new Promise<Blob>((resolve) => {
-              recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
-            });
-
-            recorder.start(100);
-            setStatus("encoding");
-            setStatusText("Recording narration...");
-
-            await new Promise<void>((resolve) => {
-              let currentPage = 0;
-              const speakNext = () => {
-                if (currentPage >= pageTexts.length) {
-                  setTimeout(() => {
-                    recorder.stop();
-                    audioTracks.forEach((t) => t.stop());
-                    resolve();
-                  }, 500);
-                  return;
-                }
-                const text = pageTexts[currentPage];
-                currentPage++;
-                if (text.trim()) {
-                  const utterance = new SpeechSynthesisUtterance(text);
-                  utterance.lang = getLangCode(narrateLang);
-                  utterance.rate = 0.9;
-                  const voices = window.speechSynthesis.getVoices();
-                  const voice = voices.find((v) =>
-                    v.lang.startsWith(getLangCode(narrateLang).substring(0, 2))
-                  );
-                  if (voice) utterance.voice = voice;
-                  utterance.onend = () =>
-                    setTimeout(speakNext, pageDuration * 1000);
-                  utterance.onerror = () =>
-                    setTimeout(speakNext, pageDuration * 1000);
-                  window.speechSynthesis.speak(utterance);
-                } else {
-                  setTimeout(speakNext, pageDuration * 1000);
-                }
-              };
-              speakNext();
-            });
-
-            audioBlob = await recorded;
+        for (let i = 0; i < pageTexts.length; i++) {
+          const text = pageTexts[i];
+          if (text.trim()) {
+            setStatusText(`Generating audio for page ${i + 1}/${pageTexts.length}...`);
+            const audio = await fetchTtsAudio(text, ttsLang);
+            if (audio) pageAudioBuffers.push(audio);
           }
-        } catch {
-          setStatusText(
-            "Audio capture denied. Generating video without narration..."
-          );
+        }
+
+        if (pageAudioBuffers.length > 0) {
+          const totalLen = pageAudioBuffers.reduce((s, b) => s + b.byteLength, 0);
+          const merged = new Uint8Array(totalLen);
+          let offset = 0;
+          for (const buf of pageAudioBuffers) {
+            merged.set(new Uint8Array(buf), offset);
+            offset += buf.byteLength;
+          }
+          await ffmpeg.writeFile("narration.mp3", merged);
+          hasAudio = true;
         }
       }
 
@@ -324,10 +324,8 @@ export function PdfToVideoConverter() {
         "frame_%04d.png",
       ];
 
-      if (audioBlob && audioBlob.size > 0) {
-        const audioData = new Uint8Array(await audioBlob.arrayBuffer());
-        await ffmpeg.writeFile("audio.webm", audioData);
-        ffmpegArgs.push("-i", "audio.webm");
+      if (hasAudio) {
+        ffmpegArgs.push("-i", "narration.mp3");
         ffmpegArgs.push(
           "-c:v", "libx264",
           "-pix_fmt", "yuv420p",
@@ -357,7 +355,7 @@ export function PdfToVideoConverter() {
       setDownloadUrl(url);
       setProgress(100);
       setStatus("done");
-      setStatusText(audioBlob ? "Video with narration ready!" : "Video ready!");
+      setStatusText(hasAudio ? "Video with narration ready!" : "Video ready!");
     } catch (err) {
       setStatus("error");
       setStatusText(
